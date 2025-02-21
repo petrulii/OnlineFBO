@@ -1,7 +1,5 @@
 import mlxp
 from funcBO.utils import set_seed
-import sys
-sys.path.append('/scratch3/clear/ipetruli/projects/BILO/ITD')
 from trainer import ITDTrainer
 
 @mlxp.launch(config_path='./configs',

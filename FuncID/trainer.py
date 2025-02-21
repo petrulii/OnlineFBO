@@ -1,101 +1,152 @@
 import torch
 import torch.nn as nn
-import sys
-sys.path.append('/scratch3/clear/ipetruli/projects/BILO')
-from utils import Trainer, DynamicCartPole, ReplayBuffer, MDPModel, QNetwork, PerformanceTracker, state_dict_to_tensor, tensor_to_state_dict, tensor_to_grad_list
-import wandb
+from utils import Trainer, state_dict_to_tensor, tensor_to_state_dict, tensor_to_grad_list
 
 class FuncIDTrainer(Trainer):
     def __init__(self, config, logger):
-        wandb.init(project="cartpole", group="CartPole_FuncID", job_type="debug", name="FuncID")
         super().__init__(config, logger)
+    
+    def compute_grad_norm(self, parameters):
+        """Compute the norm of gradients"""
+        total_norm = 0
+        for p in parameters:
+            if p.grad is not None:
+                total_norm += p.grad.data.norm(2).item() ** 2
+        return total_norm ** 0.5
 
-    def optimize_networks(self):
-        """Perform Functional Implicit Differentiation optimization"""
-
-        # (1) Inner optimization (Q-network)
-
-        for _ in range(self.inner_iters):
-
-            # Get current state and the set of possible actions
-            states, actions, _, _ = self.buffer.sample(self.batch_size)
-            states, actions = states.to(self.device), actions.to(self.device)
-            # Get MDP predictions and compute loss
-            pred_next_states, pred_rewards = self.mdp_model(states, actions)
-            q_values = self.q_network(states)
-            q_selected = q_values.gather(1, actions.unsqueeze(1)).squeeze()
-            loss = self.compute_bellman_error(q_selected, pred_rewards, pred_next_states).mean()
-            # Optimize Q-network
-            self.inner_optimizer.zero_grad()
-            loss.backward()
-            self.inner_optimizer.step()
-            # Log Q-network training info
-            wandb.log({
-                'q_loss': loss.item(),
-                'epsilon': self.epsilon,
-                'masscart': self.env.current_masscart,
-                'masspole': self.env.current_masspole
-            })
-
-        # (2) Outer optimization (MDP model)
-            
-        states, actions, rewards, next_states = self.buffer.sample(self.batch_size)
-        states, actions = states.to(self.device), actions.to(self.device)
-        rewards, next_states = rewards.to(self.device), next_states.to(self.device)
-
-        # Get inner solution predictions
+    def train_dynamics_model(self) -> float:
+        """Train the dynamics model using functional implicit differentiation"""
+        # Sample batch of transitions from buffer
+        states, _, _, _ = self.buffer.sample(self.batch_size)
+        states = states.to(self.device)
+        
+        # Consider all possible actions for each state
+        batch_states = states.repeat_interleave(2, dim=0)  # Shape: [batch_size * 2, state_dim]
+        batch_actions = torch.arange(2, device=self.device).repeat(self.batch_size)  # [0,1,0,1,...]
+        
+        # Get initial Q-network predictions for computing outer loss
         q_values = self.q_network(states)
-        q_selected = q_values.gather(1, actions.unsqueeze(1)).squeeze()
-        pred_next_states, pred_rewards = self.mdp_model(states, actions)
-
-        # Compute per-sample losses
-        inner_losses = self.compute_bellman_error(q_selected, pred_rewards, pred_next_states)
-        outer_losses = self.compute_bellman_error(q_selected, rewards, next_states)
         
-        # Compute mean losses
-        inner_loss = inner_losses.mean()
-        outer_loss = outer_losses.mean()
-        
-        # Compute adjoint as per the paper's formula
-        adjoint = -outer_losses # We don't take mean here since we need per-sample gradients
-
-        # Compute jacobian vector product between adjoint and the inner loss w.r.t. the outer model parameters
+        # Convert model parameters to single tensor for VJP
         params = state_dict_to_tensor(self.mdp_model, self.device)
         
+        # Define forward function for VJP that returns Q-value predictions
         def forward(argument):
+            # Convert tensor back to state dict and make predictions
             state_dict = tensor_to_state_dict(self.mdp_model, argument, self.device)
-            next_states_pred, rewards_pred = torch.func.functional_call(self.mdp_model, state_dict, (states, actions))
-            bellman_errors = self.compute_bellman_error(q_selected, rewards_pred, next_states_pred)
-            return bellman_errors # Return per-sample losses
+            
+            # Compute Q-predictions using the current parameters
+            batch_states = states.repeat_interleave(2, dim=0)
+            batch_actions = torch.arange(2, device=self.device).repeat(self.batch_size)
+            
+            next_states_pred, rewards_pred = torch.func.functional_call(
+                self.mdp_model, state_dict, (batch_states, batch_actions))
+            next_q_values = self.q_network(next_states_pred)
+            max_next_q_values = next_q_values.max(1)[0]
+            predicted_returns = rewards_pred + self.gamma * max_next_q_values
+            
+            # Return the reshaped predictions that match the adjoint dimensions
+            return predicted_returns.view(self.batch_size, 2)
+        
+        # Define a function to get q-network predictions for computing gradient
+        def get_q_predictions(states):
+            batch_states = states.repeat_interleave(2, dim=0)
+            batch_actions = torch.arange(2, device=self.device).repeat(self.batch_size)
+            
+            next_states_pred, rewards_pred = self.mdp_model(batch_states, batch_actions)
+            next_q_values = self.q_network(next_states_pred)
+            max_next_q_values = next_q_values.max(1)[0]
+            predicted_returns = rewards_pred + self.gamma * max_next_q_values
+            return predicted_returns.view(self.batch_size, 2)
+        
+        # Create tensor for Q predictions that requires grad
+        q_predictions = get_q_predictions(states)
+        q_predictions.requires_grad_(True)
+        
+        # Compute outer loss using these predictions
+        best_actions = q_predictions.argmax(dim=1)
+        optimal_values = q_predictions.max(dim=1)[0]
+        outer_loss = nn.MSELoss()(
+            q_values.gather(1, best_actions.unsqueeze(1)).squeeze(),
+            optimal_values
+        )
+        
+        # Compute adjoint as gradient of outer loss w.r.t q_predictions
+        outer_loss.backward()
+        adjoint = -q_predictions.grad  # Shape matches q_predictions
 
-        jvp_res = torch.autograd.functional.vjp(forward, params, adjoint, create_graph=True)
+        # Compute VJP
+        jvp_res = torch.autograd.functional.vjp(forward, params, adjoint)
         jvp_res_transformed = tensor_to_grad_list(self.mdp_model, jvp_res[1], self.device)
-
-        # Assign jvp_res_transformed to the model parameter gradients
+        
+        # Assign gradients and update model
         self.outer_optimizer.zero_grad()
         for p, g in zip(self.mdp_model.parameters(), jvp_res_transformed):
             p.grad = g
-        # Optimize MDP model
-        outer_loss.backward()
-        self.outer_optimizer.step()
-
-        # Log MDP model training info
-        wandb.log({
-            'model_loss': outer_loss.item(),
-        })
-
-        self.total_steps += 1
         
-        # Evaluetate policy
-        mean_reward, std_reward = self.evaluate_policy()
-        wandb.log({
-            'eval_reward_mean': mean_reward,
-            'eval_reward_std': std_reward
-        })
+        # Log gradient norm
+        post_vjp_grad_norm = self.compute_grad_norm(self.mdp_model.parameters())
+        
+        # Update model parameters
+        self.outer_optimizer.step()
+        
+        self.model_losses.append(outer_loss.item())
+        return outer_loss.item()
 
-    def compute_adjoint(self, state, action, reward, next_state, q_val):
-        """Compute closed-form adjoint solution"""
-        pred_next_state, pred_reward = self.mdp_model(state, action)
-        real_error = self.compute_bellman_error(q_val, reward, next_state, real=True)
-        pred_error = self.compute_bellman_error(q_val, pred_reward, pred_next_state)
-        return -(real_error - pred_error)
+    def optimize_policy(self, compute_grad: bool = False) -> torch.Tensor:
+        """
+        Optimize policy using MDP model predictions with gradient computation option.
+        Args:
+            compute_grad: If True, maintain computational graph for backprop
+        Returns:
+            policy_loss: Loss tensor (detached if compute_grad=False)
+        """
+        # Sample states from buffer as starting points
+        states, _, _, _ = self.buffer.sample(self.batch_size)
+        states = states.to(self.device)
+        
+        # Compute Q-values for the current states
+        q_values = self.q_network(states)
+    
+        # Consider all possible actions for each state
+        batch_states = states.repeat_interleave(2, dim=0)  # Shape: [batch_size * 2, state_dim]
+        batch_actions = torch.arange(2, device=self.device).repeat(self.batch_size)  # [0,1,0,1,...]
+        
+        # Use MDP model to predict outcomes for all state-action pairs
+        if not compute_grad:
+            with torch.no_grad():
+                next_states_pred, rewards_pred = self.mdp_model(batch_states, batch_actions)
+                next_q_values = self.q_network(next_states_pred)
+                max_next_q_values = next_q_values.max(1)[0]
+                predicted_returns = rewards_pred + self.gamma * max_next_q_values
+        # If gradient computation is required, maintain computational graph
+        else:
+            next_states_pred, rewards_pred = self.mdp_model(batch_states, batch_actions)
+            next_q_values = self.q_network(next_states_pred)
+            max_next_q_values = next_q_values.max(1)[0]
+            predicted_returns = rewards_pred + self.gamma * max_next_q_values
+
+        # Reshape predictions to [batch_size, n_actions]
+        predicted_returns = predicted_returns.view(self.batch_size, 2)
+    
+        # Get actions that maximize predicted return
+        best_actions = predicted_returns.argmax(dim=1)
+        optimal_values = predicted_returns.max(dim=1)[0]
+    
+        # Update Q-network to match model-based predictions
+        loss = nn.MSELoss()(
+            q_values.gather(1, best_actions.unsqueeze(1)).squeeze(),
+            optimal_values
+        )
+
+        if not compute_grad:
+            # Optimize policy
+            self.inner_optimizer.zero_grad()
+            loss.backward()
+            self.inner_optimizer.step()
+
+            self.policy_losses.append(loss.item())
+            return loss.item()
+        # If gradient computation is required, return loss tensor
+        else:
+            return loss

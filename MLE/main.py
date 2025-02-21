@@ -1,8 +1,6 @@
 import mlxp
 from funcBO.utils import set_seed
-import sys
-sys.path.append('/scratch3/clear/ipetruli/projects/BILO/MLE')
-from trainer import DynaTrainer
+from .trainer import DynaTrainer
 
 @mlxp.launch(config_path='./configs',
              seeding_function=set_seed)

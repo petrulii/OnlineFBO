@@ -4,10 +4,12 @@ import numpy as np
 import gymnasium as gym
 import numpy as np
 import math
+import wandb
 from gymnasium import spaces
 from collections import deque
+from typing import Tuple, List, Optional
 
-def state_dict_to_tensor(model, device):
+def state_dict_to_tensor(model, device) -> torch.Tensor:
   """
   A function to wrap a tensor as parameter dictionary of a neural network.
     param model: neural network
@@ -21,7 +23,7 @@ def state_dict_to_tensor(model, device):
   params = (torch.cat(current_tensor_list, 0)).to(device)#put to cuda
   return params
 
-def tensor_to_state_dict(model, params, device):
+def tensor_to_state_dict(model, params, device) -> dict:
   """
   A function to wrap a tensor as parameter dictionary of a neural network.
     param model: neural network
@@ -38,7 +40,7 @@ def tensor_to_state_dict(model, params, device):
       start = end
   return current_dict
 
-def tensor_to_grad_list(model, params, device):
+def tensor_to_grad_list(model, params, device) -> List[torch.Tensor]:
     """
     A function to wrap a tensor as list of gradients of parameters of a neural network.
         param model: neural network
@@ -57,46 +59,35 @@ def tensor_to_grad_list(model, params, device):
     return grad_list
 
 class DynamicCartPole(gym.Wrapper):
-    """CartPole environment with time-varying dynamics"""
-    def __init__(self, change_frequency=1000, noise_std=0.1):
+    """CartPole environment with smoothly varying cart mass"""
+    def __init__(self, change_frequency=10000, amplitude=0.15):
         super().__init__(gym.make("CartPole-v1"))
         self.timesteps = 0
+        self.total_timesteps = 0
         self.change_frequency = change_frequency
-        self.noise_std = noise_std
-        
-        # Default parameters from CartPole
-        self.initial_masscart = 1.0
-        self.initial_masspole = 0.1
-        self.initial_force_mag = 10.0
-        
-        # Current parameters
-        self.current_masscart = self.initial_masscart
-        self.current_masspole = self.initial_masspole
-        self.current_force_mag = self.initial_force_mag
+        self.amplitude = amplitude  # Controls how much the mass varies (e.g. 0.15 = ±15%)
+        self.base_masscart = self.env.unwrapped.masscart  # Store the initial mass
         
     def step(self, action):
-        # Update parameters periodically
-        if self.timesteps % self.change_frequency == 0:
-            # Sinusoidal variation in cart mass
-            phase = 2 * math.pi * self.timesteps / (10 * self.change_frequency)
-            self.current_masscart = self.initial_masscart * (1 + 0.3 * math.sin(phase))
-            
-            # Random walk in pole mass
-            self.current_masspole += np.random.normal(0, self.noise_std * 0.1)
-            self.current_masspole = max(0.05, min(0.2, self.current_masspole))
-            
-            # Update environment parameters
-            self.env.unwrapped.masscart = self.current_masscart
-            self.env.unwrapped.masspole = self.current_masspole
-            self.env.unwrapped.total_mass = self.current_masscart + self.current_masspole
-            self.env.unwrapped.polemass_length = self.current_masspole * self.env.unwrapped.length
+        # Compute phase
+        phase = 2 * math.pi * (self.total_timesteps / self.change_frequency)
+
+        # Reset to base mass and apply variation
+        self.env.unwrapped.masscart = self.base_masscart * (1 + self.amplitude * math.sin(phase))
+        
+        # Update total mass
+        self.env.unwrapped.total_mass = self.env.unwrapped.masscart + self.env.unwrapped.masspole
         
         self.timesteps += 1
+        self.total_timesteps += 1
         return super().step(action)
-    
+
     def reset(self, **kwargs):
-        self.timesteps = 0
-        return super().reset(**kwargs)
+        """Standard reset - starts new episode with initial conditions"""
+        obs, info = super().reset(**kwargs)
+        self.timesteps = 0  # Reset timesteps since it's a new episode
+        self.total_timesteps += 1
+        return obs, info
 
 class ReplayBuffer:
     """Stores transitions from CartPole environment"""
@@ -194,45 +185,18 @@ class QNetwork(nn.Module):
     def forward(self, state):
         return self.network(state)
 
-class PerformanceTracker:
-    """Tracks performance metrics over a sliding window"""
-    def __init__(self, window_size=100):
-        self.window_size = window_size
-        self.rewards = deque(maxlen=window_size)
-        self.episode_lengths = deque(maxlen=window_size)
-        self.prediction_errors = deque(maxlen=window_size)
-        
-    def update(self, episode_reward, episode_length, prediction_error):
-        self.rewards.append(episode_reward)
-        self.episode_lengths.append(episode_length)
-        self.prediction_errors.append(prediction_error)
-    
-    def get_metrics(self):
-        if not self.rewards:
-            return None
-        return {
-            'window_avg_reward': np.mean(self.rewards),
-            'window_avg_length': np.mean(self.episode_lengths),
-            'window_avg_pred_error': np.mean(self.prediction_errors)
-        }
-
 class Trainer:
+    """Base class for training MBRL agents"""
     def __init__(self, config, logger):
+        wandb.init(project="cartpole", job_type="debug", name=config['wandb_name'])
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.env = DynamicCartPole(
-            change_frequency=config['env_change_freq'],
-            noise_std=config['env_noise_std']
+            change_frequency=config['env_change_freq']
         )
         
         # Initialize models
         self.mdp_model = MDPModel(config['hidden_dim']).to(self.device)
         self.q_network = QNetwork(config['hidden_dim']).to(self.device)
-        self.target_q = QNetwork(config['hidden_dim']).to(self.device)
-        self.target_q.load_state_dict(self.q_network.state_dict())
-        
-        # Performance tracking
-        self.tracker = PerformanceTracker(window_size=config['window_size'])
-        self.total_steps = 0
         
         # Optimizers
         self.outer_optimizer = torch.optim.Adam(self.mdp_model.parameters(), lr=config['outer_lr'])
@@ -241,137 +205,129 @@ class Trainer:
         # Replay buffer
         self.buffer = ReplayBuffer(config['buffer_capacity'])
         
-        # Parameters
+        # Tracking metrics
+        self.returns = []
+        self.model_losses = []
+        self.policy_losses = []
+        
+        # Training parameters
         self.batch_size = config['batch_size']
         self.gamma = config['gamma']
         self.inner_iters = config['inner_iters']
         self.episodes = config['episodes']
+        self.max_episode_steps = config['max_episode_steps']
+        self.buffer_capacity = config['buffer_capacity']
         self.epsilon = config['epsilon_start']
-        self.epsilon_min = config['epsilon_min']
-        self.epsilon_decay = config['epsilon_decay']
-
-    def select_action(self, state):
-        """Epsilon-greedy action selection"""
-        if torch.rand(1).item() < self.epsilon:
+        #self.epsilon_min = config['epsilon_min']
+        #self.epsilon_decay = config['epsilon_decay']
+        self.log_interval = config['log_interval']
+        self.logger = logger
+    
+    def select_action(self, state: np.ndarray) -> int:
+        """Select action using epsilon-greedy policy"""
+        if np.random.random() < self.epsilon:
             return self.env.action_space.sample()
         
         with torch.no_grad():
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             q_values = self.q_network(state_tensor)
-            return torch.argmax(q_values).item()
+            return q_values.argmax().item()
     
-    def update_epsilon(self):
-        """Decay exploration rate"""
-        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-
-    def compute_bellman_error(self, q_val, reward, next_state, real=False):
-        """Compute Bellman error for either real or predicted transitions"""
-        with torch.no_grad():
-            next_q = self.target_q(next_state)
-            next_v = torch.logsumexp(next_q, dim=1)
-        return 0.5 * (q_val - (reward + self.gamma * next_v)) ** 2
-    
-    def step_environment(self, state, episode_length, total_reward, prediction_errors=None):
-        """Perform one step of environment interaction and data collection
+    def evaluate_policy(self, eval_episodes: int = 5, eval_steps: int = 1000) -> Tuple[float, float]:
+        """
+        Evaluate current policy without exploration
         
         Args:
-            state: Current environment state
-            episode_length: Current episode length
-            total_reward: Accumulated reward for current episode
-            prediction_errors: Optional list to store prediction errors
+            eval_episodes: Number of episodes to evaluate
+            eval_steps: Maximum steps per evaluation episode
             
         Returns:
-            tuple: (next_state, total_reward, episode_length, done)
+            Tuple of (average reward per step, average cart mass)
         """
-        # Environment interaction
-        action = self.select_action(state)
-        next_state, reward, terminated, truncated, _ = self.env.step(action)
-        done = terminated or truncated
-        episode_length += 1
-        total_reward += reward
+        total_rewards = []
+        all_masses = []
         
-        # Store transition and compute prediction error
-        self.buffer.push(state, action, reward, next_state)
-        
-        # Compute prediction error if we have a model and enough samples
-        if hasattr(self, 'mdp_model') and len(self.buffer) > 1:
-            states, actions, _, next_states = self.buffer.sample(
-                min(self.batch_size, len(self.buffer))
-            )
-            states, actions = states.to(self.device), actions.to(self.device)
-            next_states = next_states.to(self.device)
-            prediction_error = self.mdp_model.compute_prediction_error(
-                states, actions, next_states
-            )
-            if prediction_errors is not None:
-                prediction_errors.append(prediction_error.item())
-        
-        return next_state, total_reward, episode_length, done
-        
-    def optimize_networks(self):
-        raise NotImplementedError
-
-    def train_episode(self):
-        """Run one episode with Dyna-style learning"""
-        state, _ = self.env.reset()
-        total_reward = 0
-        episode_length = 0
-        prediction_errors = []
-        done = False
-        
-        while not done:
-            state, total_reward, episode_length, done = self.step_environment(
-                state, 
-                episode_length, 
-                total_reward, 
-                prediction_errors
-            )
-
-            # Start training when we have enough samples
-        if len(self.buffer) > self.batch_size:
-            self.optimize_networks()
-
-        # Compute average prediction error
-        avg_prediction_error = sum(prediction_errors) / len(prediction_errors) if prediction_errors else 0
-        
-        # Update performance tracker
-        self.tracker.update(total_reward, episode_length, avg_prediction_error)
-        
-        return total_reward, episode_length, avg_prediction_error
-
-    def train(self):
-        """Main training loop with performance tracking"""
-        
-        for episode in range(self.episodes):
-            episode_reward, episode_length, pred_error = self.train_episode()
-            self.update_epsilon()
-            
-            # Get sliding window metrics
-            window_metrics = self.tracker.get_metrics()
-
-    def evaluate_policy(self, num_episodes=5):
-        """Evaluate current policy on real environment without exploration"""
-        eval_rewards = []
-        
-        for _ in range(num_episodes):
-            state, _ = self.env.reset()
+        for _ in range(eval_episodes):
+            eval_state, _ = self.env.reset()
             episode_reward = 0
-            done = False
+            steps = 0
             
-            while not done:
-                # Select action greedily (no epsilon)
+            while steps < eval_steps:
+                # Select action using only the policy network (no exploration)
                 with torch.no_grad():
-                    state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+                    state_tensor = torch.FloatTensor(eval_state).unsqueeze(0).to(self.device)
                     q_values = self.q_network(state_tensor)
                     action = torch.argmax(q_values).item()
                 
-                # Step in real environment
+                # Execute action in environment
                 next_state, reward, terminated, truncated, _ = self.env.step(action)
-                done = terminated or truncated
+                wandb.log({'cart_mass': self.env.unwrapped.masscart})
                 episode_reward += reward
-                state = next_state
                 
-            eval_rewards.append(episode_reward)
+                # Update state and step count
+                eval_state = next_state
+                steps += 1
+                
+                # If episode ends, reset but continue counting steps
+                if terminated or truncated:
+                    eval_state, _ = self.env.reset()
+            
+            total_rewards.append(episode_reward)
         
-        # Return mean and std of evaluation rewards
-        return np.mean(eval_rewards), np.std(eval_rewards)
+        # Calculate averages across all episodes
+        avg_reward = np.mean(total_rewards) / eval_steps
+        
+        return avg_reward
+    
+    def plan_actions(self, state: torch.Tensor) -> int:
+        """Greedily plan an action using the dynamics model and Q-network."""
+        state = state.to(self.device)
+        if np.random.rand() < self.epsilon:  # Add epsilon-greedy exploration
+            return self.env.action_space.sample()
+        with torch.no_grad():
+            q_values = self.q_network(state.unsqueeze(0))
+            action = torch.argmax(q_values).item()
+        return action
+
+    def train(self) -> None:
+        """Main training loop implementing MBRL"""
+
+        for episode in range(self.episodes):
+            episode_total_reward = 0
+            state, _ = self.env.reset()
+
+            for _ in range(self.max_episode_steps):
+                # 1. Environment Interaction with Planning
+                if len(self.buffer) > self.batch_size:
+                    # Plan action using dynamics model (and epsilon-greedy)
+                    action = self.plan_actions(torch.FloatTensor(state))
+                else:
+                    # Fill the initial buffer with random actions
+                    while len(self.buffer) <= self.batch_size:
+                        action = self.env.action_space.sample()
+                        next_state, reward, terminated, truncated, _ = self.env.step(action)
+                        self.buffer.push(state, action, reward, next_state)
+                        state = next_state
+                # Execute action in environment
+                next_state, reward, terminated, truncated, _ = self.env.step(action)
+                episode_total_reward += reward
+                wandb.log({'cart_mass': self.env.unwrapped.masscart})
+                # Store transition
+                self.buffer.push(state, action, reward, next_state)
+                state = next_state
+                # Check if episode is terminated
+                if terminated or truncated:
+                    break
+                        
+                # 2. Model Learning
+                if len(self.buffer) > self.batch_size:
+                    model_loss = self.train_dynamics_model()
+                    wandb.log({'model_loss': model_loss})
+
+                # 3. Policy Optimization (inner loop)
+                if len(self.buffer) > self.batch_size:
+                    for _ in range(self.inner_iters):
+                        policy_loss = self.optimize_policy()
+                        wandb.log({'policy_loss': policy_loss})
+
+            wandb.log({'env_interaction_reward': episode_total_reward})

@@ -1,3 +1,6 @@
+.gitignore
+multirun.yaml
+
 # Python cache files
 __pycache__/
 *.py[cod]
@@ -48,3 +51,15 @@ Thumbs.db
 FuncID/data
 ITD/data
 MLE/data
+FuncID/trainer_old.py
+ITD/trainer_old.py
+MLE/trainer_old.py
+FuncID/utils.py
+ITD/utils.py
+MLE/utils.py
+FuncID/__init__.py
+ITD/__init__.py
+MLE/__init__.py
+__init__.py
+tmp.py
+funcBO/
